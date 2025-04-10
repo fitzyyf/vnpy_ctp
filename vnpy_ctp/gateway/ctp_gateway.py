@@ -2,6 +2,7 @@ import sys
 from datetime import datetime
 from time import sleep
 from pathlib import Path
+from typing import List
 
 from vnpy.event import EventEngine, Event
 from vnpy.trader.constant import (
@@ -21,6 +22,10 @@ from vnpy.trader.object import (
     PositionData,
     AccountData,
     ContractData,
+    MarginData,  # hxxjava add
+    CommissionData,  # hxxjava add
+    MarginRequest,  # hxxjava add
+    CommissionRequest,  # hxxjava add
     OrderRequest,
     CancelRequest,
     SubscribeRequest,
@@ -154,6 +159,8 @@ class CtpGateway(BaseGateway):
         """构造函数"""
         super().__init__(event_engine, gateway_name)
 
+        self.waiting_query_vt_symbols:List[str] = []
+
         self.td_api: CtpTdApi = CtpTdApi(self)
         self.md_api: CtpMdApi = CtpMdApi(self)
 
@@ -188,6 +195,9 @@ class CtpGateway(BaseGateway):
 
         self.init_query()
 
+    def add_waiting_query_vt_symbol(self,vt_symbol:str):
+        self.waiting_query_vt_symbols.append(vt_symbol)
+
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         self.md_api.subscribe(req)
@@ -207,6 +217,16 @@ class CtpGateway(BaseGateway):
     def query_position(self) -> None:
         """查询持仓"""
         self.td_api.query_position()
+
+
+    def query_commission(self,req:CommissionRequest):   # hxxjava add
+        """查询手续费数据"""
+        self.td_api.query_commission(req)
+
+    def query_margin_ratio(self,req:MarginRequest): # hxxjava add
+        """查询保证金率数据"""
+        self.td_api.query_margin_ratio(req)
+
 
     def close(self) -> None:
         """关闭接口"""
@@ -481,8 +501,115 @@ class CtpTdApi(TdApi):
             self.reqSettlementInfoConfirm(ctp_req, self.reqid)
         else:
             self.login_failed = True
-
             self.gateway.write_error("交易服务器登录失败", error)
+
+
+    def onRspQryInstrumentCommissionRate(self, data: dict, error: dict, reqid: int, last: bool):
+        """查询合约手续费率"""
+        """
+        CommissionRate {
+            'InstrumentID': 'rb', 
+            'InvestorRange': '1', 
+            'BrokerID': '9999', 
+            'InvestorID': '00000000', 
+            'OpenRatioByMoney': 0.0001, 
+            'OpenRatioByVolume': 0.0, 
+            'CloseRatioByMoney': 0.0001, 
+            'CloseRatioByVolume': 0.0, 
+            'CloseTodayRatioByMoney': 0.0001, 
+            'CloseTodayRatioByVolume': 0.0, 
+            'ExchangeID': '', 
+            'BizType': '\x00', 
+            'InvestUnitID': ''
+        }    
+        """
+        # print(f"CommissionRate {data}")
+        # print(f"error {error}")
+        if data:
+            commission = CommissionData(
+                symbol = data['InstrumentID'],
+                exchange = data["ExchangeID"], # EXCHANGE_CTP2VT[data["ExchangeID"]]
+                open_ratio_bymoney=data['OpenRatioByMoney'],
+                open_ratio_byvolume=data['OpenRatioByVolume'],
+                close_ratio_bymoney=data['CloseRatioByMoney'],
+                close_ratio_byvolume=data['CloseRatioByVolume'],
+                close_today_ratio_bymoney=data['CloseTodayRatioByMoney'],
+                close_today_ratio_byvolume=data['CloseTodayRatioByVolume'],
+                gateway_name=self.gateway_name
+            )
+            self.gateway.on_commission(commission)
+
+
+    def onRspQryInstrumentMarginRate(self, data: dict, error: dict, reqid: int, last: bool):
+        """
+        查询保证金率
+        MarginRate {
+            'InstrumentID': 'rb2010',
+            'InvestorRange': '1',
+            'BrokerID': '9999',
+            'InvestorID': '147102',
+            'HedgeFlag': '1',
+            'LongMarginRatioByMoney': 0.1,
+            'LongMarginRatioByVolume': 0.0,
+            'ShortMarginRatioByMoney': 0.1,
+            'ShortMarginRatioByVolume': 0.0,
+            'IsRelative': 0,
+            'ExchangeID': '',
+            'InvestUnitID': ''
+        }
+        """
+        # print(f"MarginRate {data}")
+        # print(f"error {error}")
+        if data:
+            margin = MarginData(
+                symbol = data['InstrumentID'],
+                exchange = data["ExchangeID"], # EXCHANGE_CTP2VT[data["ExchangeID"]]
+                long_margin_rate=data["LongMarginRatioByMoney"],
+                long_margin_perlot=data["LongMarginRatioByVolume"],
+                short_margin_rate=data["ShortMarginRatioByMoney"],
+                short_margin_perlot=data["ShortMarginRatioByVolume"],
+                is_ralative=data['IsRelative'],
+                gateway_name=self.gateway_name
+            )
+            self.gateway.on_margin(margin)
+
+    def query_commission(self,req:CommissionRequest):
+        """ 查询手续费率
+        """
+        #手续费率查询字典
+        commission_req = {}
+        commission_req['BrokerID'] = self.brokerid
+        commission_req['InvestorID'] = self.userid
+        commission_req['InstrumentID'] = req.symbol
+        commission_req['ExchangeID'] = req.exchange.value
+        self.reqid += 1
+        #请求查询手续费率
+        count = 10
+        while self.reqQryInstrumentCommissionRate(commission_req,self.reqid) != 0:
+            count -= 1
+            if count > 0:
+                sleep(0.100)
+            else:
+                break
+
+    def query_margin_ratio(self,req:MarginRequest):
+        """ 保证金率查询 """
+        #保证金率查询字典
+        margin_ratio_req = {}
+        margin_ratio_req['BrokerID'] = self.brokerid
+        margin_ratio_req['InvestorID'] = self.userid
+        margin_ratio_req['InstrumentID'] = req.symbol
+        margin_ratio_req['ExchangeID'] = req.exchange.value
+        margin_ratio_req['HedgeFlag'] = THOST_FTDC_HF_Speculation
+        self.reqid += 1
+        #请求查询保证金率
+        count = 10
+        while self.reqQryInstrumentMarginRate(margin_ratio_req,self.reqid) != 0:
+            count -= 1
+            if count > 0:
+                sleep(0.100)
+            else:
+                break
 
     def onRspOrderInsert(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """委托下单失败回报"""
@@ -610,6 +737,15 @@ class CtpTdApi(TdApi):
                 pricetick=data["PriceTick"],
                 min_volume=data["MinLimitOrderVolume"],
                 max_volume=data["MaxLimitOrderVolume"],
+                max_market_order_volume=data["MaxMarketOrderVolume"],
+                min_market_order_volume=data["MinMarketOrderVolume"],
+                max_limit_order_volume=data["MaxLimitOrderVolume"],
+                min_limit_order_volume=data["MinLimitOrderVolume"],
+                open_date=data["OpenDate"],
+                expire_date=data["ExpireDate"],
+                is_trading=data["IsTrading"],
+                long_margin_ratio=data["LongMarginRatio"],
+                short_margin_ratio=data["ShortMarginRatio"],
                 gateway_name=self.gateway_name
             )
 
